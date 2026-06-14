@@ -1,0 +1,158 @@
+{
+  "name": "Audio Picker Engine (捡漏监控+评分+脚本)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [ { "field": "minutes", "minutesInterval": 20 } ] }
+      },
+      "id": "trigger",
+      "name": "每20分钟触发",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [ 240, 400 ]
+    },
+    {
+      "parameters": {
+        "documentId": { "__rl": true, "value": "YOUR_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Watchlist", "mode": "name" },
+        "options": {}
+      },
+      "id": "read_watchlist",
+      "name": "读监控词表",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [ 460, 400 ],
+      "notes": "列: query_jp(日文搜索词), platform(yahoo/hardoff), active(TRUE)"
+    },
+    {
+      "parameters": {
+        "documentId": { "__rl": true, "value": "YOUR_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "KB", "mode": "name" },
+        "options": {}
+      },
+      "id": "read_kb",
+      "name": "读需求知识库",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [ 460, 600 ],
+      "notes": "导入 audio_demand_kb.csv"
+    },
+    {
+      "parameters": {
+        "url": "=https://auctions.yahoo.co.jp/search/search?p={{ encodeURIComponent($json.query_jp) }}&exflg=1&b=1&n=50&s1=new&o1=d",
+        "options": { "timeout": 15000 },
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "User-Agent", "value": "Mozilla/5.0" } ] }
+      },
+      "id": "fetch_yahoo",
+      "name": "抓取Yahoo拍卖",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ 680, 400 ],
+      "notes": "Hard-Off 复制本节点改 URL: netmall.hardoff.co.jp 搜索;控制频率,加随机延迟"
+    },
+    {
+      "parameters": {
+        "operation": "extractHtmlContent",
+        "extractionValues": {
+          "values": [
+            { "key": "title", "cssSelector": ".Product__title", "returnArray": true },
+            { "key": "price", "cssSelector": ".Product__priceValue", "returnArray": true },
+            { "key": "url", "cssSelector": ".Product__titleLink", "attribute": "href", "returnValue": "attribute", "returnArray": true },
+            { "key": "image", "cssSelector": ".Product__image img", "attribute": "src", "returnValue": "attribute", "returnArray": true }
+          ]
+        }
+      },
+      "id": "parse_html",
+      "name": "解析商品列表",
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [ 900, 400 ],
+      "notes": "CSS选择器随Yahoo页面结构调整;不行就改用 itemList 卡片选择器"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 把并列数组拆成逐条商品 + 解析价格数字\nconst out = [];\nfor (const item of $input.all()) {\n  const d = item.json;\n  const n = (d.title||[]).length;\n  for (let i=0;i<n;i++){\n    const priceStr = (d.price&&d.price[i]||'').replace(/[^0-9]/g,'');\n    out.push({ json: {\n      title: d.title[i]||'',\n      buy_price_jpy: parseInt(priceStr||'0',10),\n      url: d.url&&d.url[i]||'',\n      image: d.image&&d.image[i]||''\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "normalize",
+      "name": "拆条+解析价格",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 1120, 400 ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === 评分引擎 (核心IP) ===\nconst FX = 155;           // 美元兑日元, 校准用\nconst items = $input.all();\nconst kb = $('读需求知识库').all().map(x=>x.json);\nconst demandWeight = {S:1.0, A:0.7, B:0.4};\nconst shipCost = {light:2500, med:6000, heavy:15000};\nconst riskPenalty = {light:0, med:10, heavy:30};\nconst out = [];\nfor (const it of items){\n  const d = it.json;\n  const t = (d.title||'').toLowerCase();\n  // 用 jp_name / hot_models 关键词匹配 KB 行\n  const row = kb.find(r => {\n    const keys = ((r.jp_name||'')+' '+(r.hot_models||'')).toLowerCase().split(/[\\s,]+/).filter(Boolean);\n    return keys.some(k => k.length>1 && t.includes(k));\n  });\n  if(!row){ continue; } // 不在知识库 = 不关心\n  const resaleMid = (Number(row.resale_usd_low)+Number(row.resale_usd_high))/2;\n  const ship = shipCost[row.ship_class]||6000;\n  const fees = Math.round(d.buy_price_jpy*0.1)+500;\n  const cost = d.buy_price_jpy + ship + fees;\n  const revenue = resaleMid * FX;\n  const profit = Math.round(revenue - cost);\n  const margin = cost>0 ? profit/cost : 0;\n  let score = margin*100*(demandWeight[row.demand_tier]||0.4) - (riskPenalty[row.ship_class]||10) - (row.voltage_relevant==='yes'?15:0);\n  // 成色加权\n  if(/ジャンク|不動|故障|部品取り|まとめ/.test(d.title)) score += 8;\n  if(/動作未確認/.test(d.title)) score += 4;\n  const alert = margin>=0.6 && profit>=8000 && (row.demand_tier==='S'||row.demand_tier==='A');\n  out.push({ json: { ...d,\n    brand: row.brand, category: row.category, model: row.hot_models,\n    demand_tier: row.demand_tier, profit_jpy: profit,\n    margin_pct: Math.round(margin*100), deal_score: Math.round(score),\n    harvest_parts: row.category, selling_points: row.notes,\n    hot: score>=80, alert\n  }});\n}\nreturn out;"
+      },
+      "id": "score",
+      "name": "评分引擎",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 1340, 400 ]
+    },
+    {
+      "parameters": {
+        "conditions": { "options": { "caseSensitive": true, "version": 2 }, "combinator": "and",
+          "conditions": [ { "leftValue": "={{ $json.alert }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } } ] }
+      },
+      "id": "filter",
+      "name": "IF 达到预警门槛",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [ 1560, 400 ]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "modelId": { "__rl": true, "value": "claude-sonnet-4-6", "mode": "id" },
+        "messages": { "values": [ { "content": "=你是电影导演+复古音响修复师。为这件捡漏器材写60-90秒短视频拍摄脚本(英文成片,电影质感,面向欧美黑胶/复古音响爱好者)。\\n器材: {{ $json.brand }} {{ $json.model }} / 品类:{{ $json.category }} / 标题:{{ $json.title }} / 可取配件:{{ $json.harvest_parts }} / 卖点:{{ $json.selling_points }}\\n输出: 1)HOOK前3秒 2)逐镜清单(画面+旁白,突出木纹/旋钮/表头/暖光) 3)拆解高光before-after 4)价值字幕(稀缺性) 5)CTA 6)3个备选标题+10个英文长尾关键词" } ] }
+      },
+      "id": "gen_script",
+      "name": "LLM生成视频脚本",
+      "type": "n8n-nodes-base.anthropic",
+      "typeVersion": 1,
+      "position": [ 1780, 320 ],
+      "notes": "也可换成 OpenAI 节点;模型用最新可用 Claude"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "YOUR_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Deals", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData", "value": {} },
+        "options": {}
+      },
+      "id": "write_deals",
+      "name": "写入捡漏看板",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [ 2000, 320 ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🔥捡漏预警 分{{ $json.deal_score }}\\n{{ $json.brand }} {{ $json.model }}\\n价 ¥{{ $json.buy_price_jpy }} | 预估利润 ¥{{ $json.profit_jpy }} ({{ $json.margin_pct }}%)\\n{{ $json.url }}",
+        "additionalFields": {}
+      },
+      "id": "notify",
+      "name": "推送手机预警",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [ 2000, 480 ],
+      "notes": "可换 LINE / 邮件;Telegram 最省事"
+    }
+  ],
+  "connections": {
+    "每20分钟触发": { "main": [ [ { "node": "读监控词表", "type": "main", "index": 0 } ] ] },
+    "读监控词表": { "main": [ [ { "node": "读需求知识库", "type": "main", "index": 0 } ] ] },
+    "读需求知识库": { "main": [ [ { "node": "抓取Yahoo拍卖", "type": "main", "index": 0 } ] ] },
+    "抓取Yahoo拍卖": { "main": [ [ { "node": "解析商品列表", "type": "main", "index": 0 } ] ] },
+    "解析商品列表": { "main": [ [ { "node": "拆条+解析价格", "type": "main", "index": 0 } ] ] },
+    "拆条+解析价格": { "main": [ [ { "node": "评分引擎", "type": "main", "index": 0 } ] ] },
+    "评分引擎": { "main": [ [ { "node": "IF 达到预警门槛", "type": "main", "index": 0 } ] ] },
+    "IF 达到预警门槛": { "main": [ [ { "node": "LLM生成视频脚本", "type": "main", "index": 0 }, { "node": "推送手机预警", "type": "main", "index": 0 } ], [] ] },
+    "LLM生成视频脚本": { "main": [ [ { "node": "写入捡漏看板", "type": "main", "index": 0 } ] ] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "_readme": "导入n8n后需: 1)填 YOUR_SHEET_ID 和 Telegram chatId 2)配 Google Sheets/Anthropic/Telegram 凭据 3)Watchlist表填日文搜索词 4)把 audio_demand_kb.csv 导入 KB 表 5)先只跑 Yahoo 一条链路验证打分,再加 Hard-Off。CSS选择器可能随站点改版需调整。去重(Seen表)建议加在写入前。"
+}
